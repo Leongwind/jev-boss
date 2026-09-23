@@ -1,0 +1,3 @@
+<resources>
+    <string name="accessibility_description">只在 BOSS 直聘位于前台时读取当前职位或聊天页文字。生成推荐需由你点击；不会自动发送消息或投递简历。</string>
+</resources>
