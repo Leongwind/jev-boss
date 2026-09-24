@@ -1,18 +1,57 @@
 package com.sanly.jevboss
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import android.os.SystemClock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.net.URL
+import java.io.IOException
 
 data class HrQuestion(val text: String, val needsUserFact: Boolean)
 data class DraftAudit(val warnings: List<String>)
 
 class DirectApi(private val keys: SecretStore) {
-    private fun post(url: String, key: String, body: JSONObject): JSONObject {
-        val connection = URL(url).openConnection() as HttpURLConnection
+    private class ConnectTimeout(message: String, cause: Throwable) : IOException(message, cause)
+    private class RetryableHttpError(message: String, val retryAfterMs: Long?) : IOException(message)
+
+    private fun <T> timed(stage: String, host: String, started: Long, action: () -> T): T = try {
+        action()
+    } catch (error: SocketTimeoutException) {
+        val message = "$host 在${stage}阶段超时（${(SystemClock.elapsedRealtime() - started) / 1000} 秒）"
+        if (stage == "建立连接") throw ConnectTimeout(message, error)
+        throw IOException("$message；请求可能已送达，请检查服务端用量后再重试", error)
+    }
+
+    private suspend fun post(url: String, key: String, body: JSONObject): JSONObject {
+        var connectRetries = 0
+        var serverRetries = 0
+        while (true) {
+            try {
+                return postOnce(url, key, body)
+            } catch (error: ConnectTimeout) {
+                if (connectRetries++ >= 1) {
+                    throw IOException("${error.message}；请切换 Wi-Fi 或移动网络后重试", error)
+                }
+                delay(800)
+            } catch (error: RetryableHttpError) {
+                if (serverRetries++ >= 2) throw error
+                if (error.retryAfterMs != null && error.retryAfterMs > 10000) {
+                    throw IOException("${error.message}；请按服务端建议稍后重试", error)
+                }
+                delay(error.retryAfterMs ?: (1000L shl (serverRetries - 1)))
+            }
+        }
+    }
+
+    private fun postOnce(url: String, key: String, body: JSONObject): JSONObject {
+        val endpoint = URL(url)
+        val connection = endpoint.openConnection() as HttpURLConnection
+        val started = SystemClock.elapsedRealtime()
         try {
             connection.requestMethod = "POST"
             connection.connectTimeout = 15000
@@ -20,15 +59,55 @@ class DirectApi(private val keys: SecretStore) {
             connection.doOutput = true
             connection.setRequestProperty("Authorization", "Bearer $key")
             connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-            val response = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
-            val responseText = response?.bufferedReader()?.use { it.readText() } ?: ""
-            if (connection.responseCode !in 200..299) {
+            timed("建立连接", endpoint.host, started) { connection.connect() }
+            timed("发送请求", endpoint.host, started) {
+                connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            }
+            val status = timed("等待响应", endpoint.host, started) { connection.responseCode }
+            val responseText = timed("读取响应", endpoint.host, started) {
+                val response = if (status in 200..299) connection.inputStream else connection.errorStream
+                response?.bufferedReader()?.use { it.readText() } ?: ""
+            }
+            if (status !in 200..299) {
                 val message = runCatching { JSONObject(responseText).optJSONObject("error")?.optString("message") }.getOrNull()
-                error("API 请求失败 ${connection.responseCode}${message?.let { "：${TextTools.redact(it).take(160)}" } ?: ""}")
+                val detail = "API 请求失败 $status${message?.let { "：${TextTools.redact(it).take(160)}" } ?: ""}"
+                if (status == 429 || status == 529) {
+                    val retryAfterMs = connection.getHeaderField("Retry-After")?.toLongOrNull()
+                        ?.coerceIn(1, 3600)?.times(1000)
+                    throw RetryableHttpError(detail, retryAfterMs)
+                }
+                error(detail)
             }
             return JSONObject(responseText)
+        } catch (error: UnknownHostException) {
+            throw IOException("无法解析 ${endpoint.host}，请检查手机网络或 DNS", error)
         } finally { connection.disconnect() }
+    }
+
+    suspend fun probeJev(): String = withContext(Dispatchers.IO) {
+        val key = keys.get("typesafe")
+        require(key.isNotBlank()) { "请先填写 Jev/TypeSafe API 密钥" }
+        val url = "https://api.typesafe.ai/v1/systemone"
+        val getStarted = SystemClock.elapsedRealtime()
+        val getResult = runCatching {
+            val connection = URL(url).openConnection() as HttpURLConnection
+            try {
+                connection.connectTimeout = 15000
+                connection.readTimeout = 15000
+                "GET HTTP ${connection.responseCode}（${(SystemClock.elapsedRealtime() - getStarted) / 1000} 秒）"
+            } finally { connection.disconnect() }
+        }.getOrElse { "GET ${it.javaClass.simpleName}（${(SystemClock.elapsedRealtime() - getStarted) / 1000} 秒）" }
+        val body = JSONObject().put("model", "jev-latest")
+            .put("state", "连接诊断")
+            .put("questions", JSONObject().put("reachable", JSONObject()
+                .put("type", "noul")
+                .put("instructions", "这是一条连接诊断请求吗？")))
+        val started = SystemClock.elapsedRealtime()
+        val postResult = runCatching {
+            post(url, key, body).getJSONObject("answers").getJSONObject("reachable").getDouble("noul")
+            "POST 成功（${(SystemClock.elapsedRealtime() - started) / 1000} 秒）"
+        }.getOrElse { "POST 失败：${it.message ?: it.javaClass.simpleName}" }
+        "Jev 连接诊断：$getResult；$postResult"
     }
 
     suspend fun match(job: String, resumes: List<Resume>): List<Match> = withContext(Dispatchers.IO) {

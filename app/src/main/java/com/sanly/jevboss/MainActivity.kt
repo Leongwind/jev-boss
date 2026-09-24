@@ -1,10 +1,10 @@
 package com.sanly.jevboss
 
 import android.content.Intent
+import android.content.ComponentName
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
-import android.view.accessibility.AccessibilityManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -32,6 +32,7 @@ class MainActivity : ComponentActivity() {
                 var typesafeKey by remember { mutableStateOf("") }
                 var deepseekKey by remember { mutableStateOf("") }
                 var notice by remember { mutableStateOf(store.errorMessage().orEmpty()) }
+                var probingJev by remember { mutableStateOf(false) }
                 val scope = rememberCoroutineScope()
                 val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
                     scope.launch {
@@ -92,6 +93,15 @@ class MainActivity : ComponentActivity() {
                                 deepseekKey = ""
                                 notice = "密钥已保存在本机"
                             }) { Text("保存密钥") }
+                            Button(onClick = {
+                                probingJev = true
+                                notice = "正在测试 Jev 最小请求…"
+                                scope.launch {
+                                    notice = runCatching { DirectApi(secrets).probeJev() }
+                                        .getOrElse { "Jev 连接诊断失败：${it.message ?: it.javaClass.simpleName}" }
+                                    probingJev = false
+                                }
+                            }, enabled = !probingJev) { Text(if (probingJev) "正在诊断 Jev…" else "诊断 Jev 连接") }
                         }
                         item {
                             HorizontalDivider()
@@ -128,9 +138,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun isAccessibilityEnabled(): Boolean {
-        val manager = getSystemService(ACCESSIBILITY_SERVICE) as AccessibilityManager
-        return manager.getEnabledAccessibilityServiceList(android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
-            .any { it.resolveInfo.serviceInfo.packageName == packageName &&
-                it.resolveInfo.serviceInfo.name == BossAccessibilityService::class.java.name }
+        val target = ComponentName(this, BossAccessibilityService::class.java)
+        return Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+            .orEmpty().split(':').any { ComponentName.unflattenFromString(it) == target }
     }
 }

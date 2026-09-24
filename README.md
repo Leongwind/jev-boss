@@ -47,3 +47,5 @@ APK 位于 `app/build/outputs/apk/debug/app-debug.apk`。项目只生成调试�
 - DeepSeek：`POST https://api.deepseek.com/responses`，模型 `deepseek-flash`，负责生成 JSON 格式文案候选。
 
 两个服务均由手机通过 HTTPS 直连，使用用户自己填写的密钥。服务无后台服务器，也不采集账户密码。
+
+主界面的“诊断 Jev 连接”只发送一条固定的最小测试请求，不包含 JD、简历或聊天内容。诊断中的 GET 返回 HTTP 405 表示域名可达，因为该接口只接受 POST。若 POST 在建立连接时超时，应用会自动重连一次；仍失败时可切换 Wi-Fi/移动网络再试。HTTP 429/529 会有限次退避重试；请求已发送后的读取超时不会自动重试，以免重复计费。余额正常不能排除手机到 API 的网络超时。
